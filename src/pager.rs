@@ -1,0 +1,218 @@
+use shell_words::ParseError;
+use std::env;
+
+/// If we use a pager, this enum tells us from where we were told to use it.
+#[derive(Debug, PartialEq)]
+pub(crate) enum PagerSource {
+    /// From --config
+    Config,
+
+    /// From the env var BAT_PAGER
+    EnvVarBatPager,
+
+    /// From the env var PAGER
+    EnvVarPager,
+
+    /// No pager was specified, default is used
+    Default,
+}
+
+/// We know about some pagers, for example 'less'. This is a list of all pagers we know about
+#[derive(Debug, PartialEq)]
+pub(crate) enum PagerKind {
+    /// bat
+    Bat,
+
+    /// less
+    Less,
+
+    /// more
+    More,
+
+    /// most
+    Most,
+
+    /// builtin
+    Builtin,
+
+    /// A pager we don't know about
+    Unknown,
+}
+
+impl PagerKind {
+    fn from_bin(bin: &str) -> PagerKind {
+        use std::path::Path;
+
+        if bin == "builtin" {
+            return PagerKind::Builtin;
+        }
+
+        // Set to `less` by default on most Linux distros.
+        let pager_bin = Path::new(bin).file_stem();
+
+        // The name of the current running binary. Normally `bat` but sometimes
+        // `batcat` for compatibility reasons.
+        let current_bin = env::args_os().next();
+
+        // Check if the current running binary is set to be our pager.
+        let is_current_bin_pager = current_bin
+            .map(|s| Path::new(&s).file_stem() == pager_bin)
+            .unwrap_or(false);
+
+        match pager_bin.map(|s| s.to_string_lossy()).as_deref() {
+            Some("less") => PagerKind::Less,
+            Some("more") => PagerKind::More,
+            Some("most") => PagerKind::Most,
+            _ if is_current_bin_pager => PagerKind::Bat,
+            _ => PagerKind::Unknown,
+        }
+    }
+}
+
+/// A pager such as 'less', and from where we got it.
+#[derive(Debug)]
+pub(crate) struct Pager {
+    /// The pager binary
+    pub bin: String,
+
+    /// The pager binary arguments (that we might tweak)
+    pub args: Vec<String>,
+
+    /// What pager this is
+    pub kind: PagerKind,
+
+    /// From where this pager comes
+    pub source: PagerSource,
+}
+
+impl Pager {
+    fn new(bin: &str, args: &[String], kind: PagerKind, source: PagerSource) -> Pager {
+        Pager {
+            bin: String::from(bin),
+            args: args.to_vec(),
+            kind,
+            source,
+        }
+    }
+}
+
+/// Returns what pager to use, after looking at both config and environment variables.
+pub(crate) fn get_pager(config_pager: Option<&str>) -> Result<Option<Pager>, ParseError> {
+    let bat_pager = env::var("BAT_PAGER");
+    let pager = env::var("PAGER");
+
+    let (cmd, source) = match (config_pager, &bat_pager, &pager) {
+        (Some(config_pager), _, _) => (config_pager, PagerSource::Config),
+        (_, Ok(bat_pager), _) => (bat_pager.as_str(), PagerSource::EnvVarBatPager),
+        (_, _, Ok(pager)) => (pager.as_str(), PagerSource::EnvVarPager),
+        _ => ("less", PagerSource::Default),
+    };
+
+    let parts = split_command(cmd)?;
+    match parts.split_first() {
+        Some((bin, args)) => {
+            let kind = PagerKind::from_bin(bin);
+
+            let use_less_instead = if source == PagerSource::EnvVarPager {
+                // 'more' and 'most' do not supports colors; automatically use
+                // 'less' instead if the problematic pager came from the
+                // generic PAGER env var.
+                // If PAGER=bat, silently use 'less' instead to prevent
+                // recursion.
+                // Never silently use 'less' if BAT_PAGER or --pager has been
+                // specified.
+                matches!(kind, PagerKind::More | PagerKind::Most | PagerKind::Bat)
+            } else {
+                false
+            };
+
+            Ok(Some(if use_less_instead {
+                let no_args = vec![];
+                Pager::new("less", &no_args, PagerKind::Less, PagerSource::EnvVarPager)
+            } else {
+                Pager::new(bin, args, kind, source)
+            }))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Splits a pager command into the program and its arguments.
+fn split_command(cmd: &str) -> Result<Vec<String>, ParseError> {
+    if cfg!(windows) {
+        split_command_windows(cmd)
+    } else {
+        shell_words::split(cmd)
+    }
+}
+
+/// Like `shell_words::split`, but `\` is not an escape character, since it is
+/// the path separator on Windows: `C:\tools\less.exe` must not become
+/// `C:toolsless.exe`. Single and double quotes still group words.
+fn split_command_windows(cmd: &str) -> Result<Vec<String>, ParseError> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut in_word = false;
+    let mut quote = None;
+
+    for c in cmd.chars() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => word.push(c),
+            None if c == '"' || c == '\'' => {
+                quote = Some(c);
+                in_word = true;
+            }
+            None if c.is_whitespace() => {
+                if in_word {
+                    words.push(std::mem::take(&mut word));
+                    in_word = false;
+                }
+            }
+            None => {
+                word.push(c);
+                in_word = true;
+            }
+        }
+    }
+
+    if quote.is_some() {
+        return Err(ParseError);
+    }
+    if in_word {
+        words.push(word);
+    }
+    Ok(words)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_command_windows;
+
+    #[test]
+    fn split_command_windows_keeps_backslashes() {
+        let cases: &[(&str, &[&str])] = &[
+            (r"C:\tools\less.exe", &[r"C:\tools\less.exe"]),
+            (r"C:\tools\less.exe -R", &[r"C:\tools\less.exe", "-R"]),
+            (
+                r#""C:\Program Files\Less\less.exe" -R"#,
+                &[r"C:\Program Files\Less\less.exe", "-R"],
+            ),
+            (
+                r"'C:\Program Files\Less\less.exe'",
+                &[r"C:\Program Files\Less\less.exe"],
+            ),
+            (r#"less --prompt="a b" """#, &["less", "--prompt=a b", ""]),
+            ("  less   -R  ", &["less", "-R"]),
+            ("", &[]),
+        ];
+        for (cmd, expected) in cases {
+            assert_eq!(split_command_windows(cmd).unwrap(), *expected, "{cmd}");
+        }
+    }
+
+    #[test]
+    fn split_command_windows_rejects_unclosed_quote() {
+        assert!(split_command_windows(r#""C:\tools\less.exe"#).is_err());
+    }
+}
